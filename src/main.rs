@@ -5,6 +5,7 @@ mod ptrace_ex;
 mod ptrace_ext;
 pub(crate) mod wuwa;
 
+use std::fs;
 use std::os::fd::AsFd;
 use std::os::unix::prelude::OsStrExt;
 use std::path::Path;
@@ -128,6 +129,9 @@ fn main() -> Result<()> {
                             "Injection succeeded! handle={:#x} base={:#x} {hider_summary}",
                             info.dl_handle, info.base_addr
                         );
+                        if let Err(e) = write_injection_result(&event, &cli.lib, &info) {
+                            warn!("Failed to write injection result: {e:#}");
+                        }
                     },
                     Err(e) => warn!("Injection failed: {e:#}"),
                 }
@@ -190,4 +194,41 @@ fn wait_for_proc_ready(pid: i32, timeout: Duration) -> Result<bool> {
             return Ok(true);
         }
     }
+}
+
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct InjectionResult<'a> {
+    process_name: &'a str,
+    pid: i32,
+    uid: i32,
+    lib_path: &'a str,
+    #[serde(flatten)]
+    info: &'a injector::InjectedInfo,
+}
+
+fn write_injection_result(
+    event: &proc_monitor::ProcStartEvent,
+    lib_path: &str,
+    info: &injector::InjectedInfo,
+) -> Result<()> {
+    let exe_dir = fs::read_link("/proc/self/exe").context("Failed to readlink /proc/self/exe")?;
+    let exe_dir = exe_dir.parent().unwrap_or(Path::new("/data/local/tmp"));
+    let toml_path = exe_dir.join("injection_result.toml");
+    info!("Writing injection result to {}", toml_path.display());
+
+    let result = InjectionResult {
+        process_name: &event.process_name,
+        pid: event.pid,
+        uid: event.uid,
+        lib_path,
+        info,
+    };
+
+    let content = toml::to_string_pretty(&result).context("Failed to serialize to toml")?;
+    fs::write(&toml_path, content).context("Failed to write toml file")?;
+
+    info!("Injection result written to {}", toml_path.display());
+    Ok(())
 }

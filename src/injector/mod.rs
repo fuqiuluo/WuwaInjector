@@ -6,16 +6,42 @@ use crate::ptrace_ex::{find_remote_lib_base, remote_close, remote_dlsym};
 use crate::ptrace_ext::RemoteProcess;
 use anyhow::{Result, bail};
 use log::{debug, info, warn};
+use proc_maps::get_process_maps;
 use std::path::Path;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 
+/// 注入库的内存映射区域
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LibMemoryRegion {
+    #[serde(serialize_with = "serialize_hex")]
+    pub start: usize,
+    #[serde(serialize_with = "serialize_hex")]
+    pub end: usize,
+    pub perms: String,
+    #[serde(serialize_with = "serialize_hex")]
+    pub offset: usize,
+    pub path: String,
+}
+
 /// 注入结果
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct InjectedInfo {
+    #[serde(serialize_with = "serialize_hex")]
     pub dl_handle: usize,
+    #[serde(serialize_with = "serialize_hex")]
     pub base_addr: usize,
+    pub lib_size: u64,
+    pub memory_regions: Vec<LibMemoryRegion>,
+    #[serde(skip)]
     pub hider_results: Vec<(String, bool)>,
+}
+
+fn serialize_hex<S>(val: &usize, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    s.serialize_str(&format!("0x{:x}", val))
 }
 
 impl InjectedInfo {
@@ -123,6 +149,8 @@ fn do_inject(
         warn!("Could not find library base address in maps");
     }
 
+    let (memory_regions, lib_size) = collect_lib_regions(pid, &load.maps_search_name);
+
     let mut hider_results = Vec::new();
     if load.base_addr != 0 {
         let target = HideTarget::new(proc, pid, load.base_addr, &load.maps_search_name)?;
@@ -154,6 +182,46 @@ fn do_inject(
     Ok(InjectedInfo {
         dl_handle: load.handle,
         base_addr: load.base_addr,
+        lib_size,
+        memory_regions,
         hider_results,
     })
+}
+
+fn collect_lib_regions(pid: i32, search_name: &str) -> (Vec<LibMemoryRegion>, u64) {
+    let maps = match get_process_maps(pid) {
+        Ok(m) => m,
+        Err(_) => return (Vec::new(), 0),
+    };
+
+    let mut regions = Vec::new();
+    let mut total_size: u64 = 0;
+
+    for map in &maps {
+        let path = match map.filename() {
+            Some(p) => p.to_string_lossy(),
+            None => continue,
+        };
+        if !path.contains(search_name) {
+            continue;
+        }
+
+        let perms = format!(
+            "{}{}{}",
+            if map.is_read() { "r" } else { "-" },
+            if map.is_write() { "w" } else { "-" },
+            if map.is_exec() { "x" } else { "-" },
+        );
+
+        total_size += map.size() as u64;
+        regions.push(LibMemoryRegion {
+            start: map.start(),
+            end: map.start() + map.size(),
+            perms,
+            offset: map.offset,
+            path: path.to_string(),
+        });
+    }
+
+    (regions, total_size)
 }
