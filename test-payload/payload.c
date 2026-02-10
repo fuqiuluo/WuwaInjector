@@ -269,8 +269,6 @@ static void init(void) {
 
 __attribute__((visibility("default")))
 int JNI_OnLoad(void *vm, void *reserved) {
-    (void)vm;
-
     if (reserved != (void *)INJECTOR_KEY) {
         __android_log_print(ANDROID_LOG_WARN, TAG,
             "JNI_OnLoad: key mismatch (got %p, expected %p), ignoring",
@@ -280,6 +278,22 @@ int JNI_OnLoad(void *vm, void *reserved) {
 
     __android_log_print(ANDROID_LOG_INFO, TAG,
         "JNI_OnLoad called by injector! pid=%d uid=%d", getpid(), getuid());
+
+    if (vm) {
+        static const unsigned char elf_magic[4] = { 0x7f, 'E', 'L', 'F' };
+        const unsigned char *base = (const unsigned char *)vm;
+        if (memcmp(base, elf_magic, 4) == 0) {
+            __android_log_print(ANDROID_LOG_INFO, TAG,
+                "base=%p is valid ELF (magic: %02x %02x %02x %02x)",
+                vm, base[0], base[1], base[2], base[3]);
+        } else {
+            __android_log_print(ANDROID_LOG_WARN, TAG,
+                "base=%p is NOT ELF (got: %02x %02x %02x %02x)",
+                vm, base[0], base[1], base[2], base[3]);
+        }
+    } else {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "base is NULL");
+    }
 
     dump_self_maps();
     dump_solist();

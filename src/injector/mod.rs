@@ -104,8 +104,8 @@ pub fn inject(
             match remote_dlsym(&proc, info.dl_handle, "JNI_OnLoad") {
                 Ok(ep) if ep != 0 => {
                     let key = jni_key.unwrap_or(0);
-                    info!("Calling JNI_OnLoad at {:#x} (key={:#x})", ep, key);
-                    if let Err(e) = proc.call_function(ep, &[0, key]) {
+                    info!("Calling JNI_OnLoad at {:#x} (base={:#x}, key={:#x})", ep, info.base_addr, key);
+                    if let Err(e) = proc.call_function(ep, &[info.base_addr, key]) {
                         warn!("JNI_OnLoad call failed: {e:#}");
                     }
                 }
