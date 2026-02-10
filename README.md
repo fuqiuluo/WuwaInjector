@@ -86,7 +86,7 @@ src/
 - [xDL](https://github.com/nicedayzhu/xDL) — Android 动态链接器增强库
 - [KittyMemoryEx](https://github.com/MJx0/KittyMemoryEx) — Android 内存工具库
 - [AndKittyInjector](https://github.com/MJx0/AndKittyInjector) — soinfo 动态探测技术参考
-- [fake-linker](https://github.com/nicedayzhu/fake-linker) — soinfo 硬编码偏移参考（各 Android 版本）
+- [fake-linker](https://github.com/sanfengAndroid/fake-linker) — soinfo 硬编码偏移参考（各 Android 版本）
 - [Riru](https://github.com/RikkaApps/Riru) — maps 隐藏（remap 匿名映射）技术参考
 - [android-wuwa](https://github.com/fuqiuluo/android-wuwa) — WuWa 内核驱动，提供内核层 maps/signal 过滤能力
 - [fadeevab](https://fadeevab.com/shared-library-injection-on-android-8/) — default_caller / LR 远程函数调用技术参考
