@@ -13,7 +13,8 @@ Android 平台进程注入工具，使用 Rust 编写，通过 NDK 交叉编译�
   - `solist`：修改 linker soinfo 链表，从动态链接器中 unlink 目标库
   - `kernel-maps`：通过 WuWa 内核驱动在 VFS 层完全隐藏 maps 条目
   - `kernel-signal`：通过 WuWa 内核驱动过滤 SIGPROF，防止 profiler 采样泄漏注入库 PC 地址
-- 注入完成后自动调用 `JNI_OnLoad` 并恢复目标进程状态
+- 注入完成后自动调用 `JNI_OnLoad`（第一个参数传入注入库基地址，第二个参数传入 key）并恢复目标进程状态
+- 注入完成后在可执行文件同目录下生成 `injection_result.toml`，记录注入结果（进程名、pid、uid、lib 路径、lib 大小、内存映射区域等）
 - 支持 `--jni-key` 验证机制，防止 payload 被系统或其他加载器误触发
 
 ## 环境要求
@@ -58,6 +59,45 @@ injector -p <包名> -l <so路径> --jni-key 0x1337 memfd
 - `--hider`：启用的隐藏器，可多次指定
 - `--jni-key`：JNI_OnLoad 验证 key，通过 `reserved` 参数传递给 payload，payload 端校验不通过则跳过初始化
 - 子命令 `dlopen` / `memfd`：选择注入方式
+
+## 注入结果文件
+
+注入成功后会在可执行文件同目录下生成 `injection_result.toml`，内容示例：
+
+```toml
+process_name = "com.example.app"
+pid = 12345
+uid = 10086
+lib_path = "/data/local/tmp/libpayload.so"
+dl_handle = "0x7abc000000"
+base_addr = "0x7abc123000"
+lib_size = 65536
+
+[[memory_regions]]
+start = "0x7abc123000"
+end = "0x7abc124000"
+perms = "r-x"
+offset = "0x0"
+path = "/data/local/tmp/libpayload.so"
+
+[[memory_regions]]
+start = "0x7abc124000"
+end = "0x7abc125000"
+perms = "rw-"
+offset = "0x1000"
+path = "/data/local/tmp/libpayload.so"
+```
+
+## JNI_OnLoad 调用约定
+
+注入器在完成注入和隐藏后，会远程调用 payload 的 `JNI_OnLoad`：
+
+```c
+int JNI_OnLoad(void *base_addr, void *key);
+```
+
+- `base_addr`：注入库在目标进程中的基地址，payload 可直接读取验证 ELF header
+- `key`：通过 `--jni-key` 传入的验证值，payload 端校验不通过可跳过初始化
 
 ## 项目结构
 
