@@ -1,5 +1,6 @@
 pub mod kernel_maps;
 pub mod kernel_signal;
+pub mod kernel_signal_deny;
 pub mod maps;
 pub mod solist;
 

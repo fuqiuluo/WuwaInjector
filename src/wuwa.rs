@@ -248,7 +248,8 @@ pub const SIGNAL_FILTER_MAX_REGIONS: usize = 16;
 pub struct WuwaSignalFilterCmd {
     pub pid: i32,
     pub action: u32,
-    pub sigmask: u64,
+    pub sigmask: u64,          /* REGION mode: filter by PC address range */
+    pub deny_sigmask: u64,     /* DENY mode: unconditional block + kill (priority > REGION) */
     pub region_count: u32,
     pub _padding: u32,
     pub regions: [WuwaSignalFilterRegion; SIGNAL_FILTER_MAX_REGIONS],
@@ -1722,14 +1723,16 @@ impl WuWaDriver {
 
     /// Add or update a signal filter rule for a process
     ///
-    /// When signals matching the sigmask are delivered to the target process,
-    /// and the process PC is within one of the specified regions, the signal
-    /// delivery is suppressed.
+    /// Supports two filtering modes that can be combined:
+    /// - REGION mode (sigmask): signals are blocked only when PC is within a protected region
+    /// - DENY mode (deny_sigmask): signals are unconditionally blocked, crash info dumped to
+    ///   dmesg, and the process is killed with SIGKILL. DENY takes priority over REGION.
     ///
     /// # Arguments
     /// * `pid` - Target process PID
-    /// * `sigmask` - Bitmask of signals to filter (bit N = signal N)
-    /// * `regions` - Protected memory regions (max 16)
+    /// * `sigmask` - REGION mode bitmask (bit N = signal N, filter by PC)
+    /// * `deny_sigmask` - DENY mode bitmask (bit N = signal N, unconditional block + kill)
+    /// * `regions` - Protected memory regions (max 16, for REGION mode)
     ///
     /// # Returns
     /// 0 on success, negative error code on failure
@@ -1737,6 +1740,7 @@ impl WuWaDriver {
         &self,
         pid: pid_t,
         sigmask: u64,
+        deny_sigmask: u64,
         regions: &[WuwaSignalFilterRegion],
     ) -> Result<i32, anyhow::Error> {
         let count = std::cmp::min(regions.len(), SIGNAL_FILTER_MAX_REGIONS);
@@ -1744,6 +1748,7 @@ impl WuWaDriver {
             pid,
             action: 0,
             sigmask,
+            deny_sigmask,
             region_count: count as u32,
             _padding: 0,
             regions: [WuwaSignalFilterRegion { start: 0, end: 0 }; SIGNAL_FILTER_MAX_REGIONS],
@@ -1777,6 +1782,7 @@ impl WuWaDriver {
             pid,
             action: 1,
             sigmask: 0,
+            deny_sigmask: 0,
             region_count: 0,
             _padding: 0,
             regions: [WuwaSignalFilterRegion { start: 0, end: 0 }; SIGNAL_FILTER_MAX_REGIONS],
@@ -1803,15 +1809,16 @@ impl WuWaDriver {
     /// * `pid` - Target process PID
     ///
     /// # Returns
-    /// Tuple of (sigmask, regions) on success
+    /// Tuple of (sigmask, deny_sigmask, regions) on success
     pub fn query_signal_filter(
         &self,
         pid: pid_t,
-    ) -> Result<(u64, Vec<WuwaSignalFilterRegion>), anyhow::Error> {
+    ) -> Result<(u64, u64, Vec<WuwaSignalFilterRegion>), anyhow::Error> {
         let mut cmd = WuwaSignalFilterCmd {
             pid,
             action: 2,
             sigmask: 0,
+            deny_sigmask: 0,
             region_count: 0,
             _padding: 0,
             regions: [WuwaSignalFilterRegion { start: 0, end: 0 }; SIGNAL_FILTER_MAX_REGIONS],
@@ -1835,7 +1842,7 @@ impl WuWaDriver {
 
         let count = cmd.region_count as usize;
         let regions = cmd.regions[..count].to_vec();
-        Ok((cmd.sigmask, regions))
+        Ok((cmd.sigmask, cmd.deny_sigmask, regions))
     }
 
     /// Add or update a maps filter rule for a process

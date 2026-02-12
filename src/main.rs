@@ -23,6 +23,7 @@ enum HiderKind {
     Solist,
     KernelMaps,
     KernelSignal,
+    KernelSignalDeny,
 }
 
 #[derive(Parser)]
@@ -70,6 +71,7 @@ fn build_hiders(kinds: &[HiderKind]) -> Vec<Box<dyn hider::Hider>> {
                 HiderKind::Solist => Box::new(hider::solist::SolistHider),
                 HiderKind::KernelMaps => Box::new(hider::kernel_maps::KernelMapsHider),
                 HiderKind::KernelSignal => Box::new(hider::kernel_signal::KernelSignalHider),
+                HiderKind::KernelSignalDeny => Box::new(hider::kernel_signal_deny::KernelSignalDenyHider),
             }
         })
         .collect()

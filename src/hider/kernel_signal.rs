@@ -47,7 +47,7 @@ impl Hider for KernelSignalHider {
 
         let driver = WuWaDriver::new().context("kernel-signal: failed to connect to WuWa driver")?;
         let result = driver
-            .add_signal_filter(target.pid, mask, &regions)
+            .add_signal_filter(target.pid, mask, 0, &regions)
             .context("kernel-signal: add_signal_filter failed")?;
 
         if result != 0 {
