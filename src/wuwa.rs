@@ -270,9 +270,30 @@ pub struct WuwaMapsFilterCmd {
     pub pid: i32,
     pub action: u32,
     pub region_count: u32,
-    pub mode: u32,  /* 0=hide, 1=---p, 2=rw-p */
+    pub mode: u32,  /* 0=hide, 1=---p, 2=rw-p, 3=split+---p, 4=split+rw-p */
     pub regions: [WuwaMapsFilterRegion; MAPS_FILTER_MAX_REGIONS],
     pub result: i32,
+}
+
+// Fault IPC structures — data-abort based IPC channel (no fd)
+
+pub const WUWA_FAULT_MAGIC: u64 = 0x5755574146413137;
+pub const FAULT_IPC_GUARD_START: u64 = 0x1000;
+pub const FAULT_IPC_GUARD_END: u64 = 0x10000;
+
+#[repr(C)]
+pub struct WuwaFaultHandshake {
+    pub magic: u64,
+    pub trigger_addr: u64,
+    pub key: u64,
+}
+
+#[repr(C)]
+pub struct WuwaFaultRequest {
+    pub key: u64,
+    pub ioctl_cmd: u32,
+    pub _pad: u32,
+    pub arg: u64,
 }
 
 #[repr(C)]
@@ -717,9 +738,17 @@ pub struct MemRegionsResult {
     pub entry_count: size_t, // Number of region entries
 }
 
+/// Transport backend for WuWa driver
+enum WuwaTransport {
+    /// Socket-based transport (traditional)
+    Socket(OwnedFd),
+    /// Fault IPC transport (data-abort based, no fd)
+    FaultIpc { trigger_addr: u64, key: u64 },
+}
+
 /// WuWa driver connection handle
 pub struct WuWaDriver {
-    sock: OwnedFd,
+    transport: WuwaTransport,
 }
 
 impl WuWaDriver {
@@ -775,7 +804,7 @@ impl WuWaDriver {
     /// Connect to WuWa driver. Requires root or CAP_NET_RAW.
     pub fn new() -> Result<Self, anyhow::Error> {
         let sock = Self::driver_id()?;
-        Ok(Self { sock })
+        Ok(Self { transport: WuwaTransport::Socket(sock) })
     }
 
     /// Create WuWaDriver from existing file descriptor
@@ -790,7 +819,69 @@ impl WuWaDriver {
     /// WuWaDriver instance that will close fd on destruction
     pub fn from_fd(fd: c_int) -> Self {
         Self {
-            sock: unsafe { OwnedFd::from_raw_fd(fd) },
+            transport: WuwaTransport::Socket(unsafe { OwnedFd::from_raw_fd(fd) }),
+        }
+    }
+
+    /// Create WuWaDriver from fault IPC handshake result
+    ///
+    /// Uses data-abort based IPC channel instead of socket fd.
+    /// No file descriptors are created — invisible to /proc/pid/fd.
+    ///
+    /// # Arguments
+    /// * `trigger_addr` - Negotiated trigger address from handshake
+    /// * `key` - Session key from handshake
+    pub fn from_fault_ipc(trigger_addr: u64, key: u64) -> Self {
+        Self {
+            transport: WuwaTransport::FaultIpc { trigger_addr, key },
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn fault_ipc_trigger(arg: *mut c_void, fault_addr: u64) -> i64 {
+        let result: i64;
+        unsafe {
+            std::arch::asm!(
+                "ldr x2, [x1]",
+                inout("x0") arg as i64 => result,
+                in("x1") fault_addr,
+                out("x2") _,
+                options(nostack),
+            );
+        }
+        result
+    }
+
+    fn do_ioctl(&self, cmd: Ioctl, arg: *mut c_void) -> Result<(), anyhow::Error> {
+        match &self.transport {
+            WuwaTransport::Socket(sock) => unsafe {
+                let result = ioctl(sock.as_raw_fd(), cmd, arg);
+                if result < 0 {
+                    return Err(anyhow!("ioctl failed"));
+                }
+                Ok(())
+            },
+            #[cfg(target_arch = "aarch64")]
+            WuwaTransport::FaultIpc { trigger_addr, key } => {
+                let mut req = WuwaFaultRequest {
+                    key: *key,
+                    ioctl_cmd: cmd as u32,
+                    _pad: 0,
+                    arg: arg as u64,
+                };
+                let ret = Self::fault_ipc_trigger(
+                    &mut req as *mut _ as *mut c_void,
+                    *trigger_addr,
+                );
+                if ret < 0 {
+                    return Err(anyhow!("fault ipc failed: {}", ret));
+                }
+                Ok(())
+            },
+            #[cfg(not(target_arch = "aarch64"))]
+            WuwaTransport::FaultIpc { .. } => {
+                Err(anyhow!("fault IPC only supported on aarch64"))
+            },
         }
     }
 
@@ -798,16 +889,8 @@ impl WuWaDriver {
     pub fn addr_translate(&self, pid: pid_t, va: usize) -> Result<u64, anyhow::Error> {
         let mut cmd = WuwaAddrTranslateCmd { phy_addr: 0, pid, va };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_ADDR_TRANSLATE,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("VA->PA translation failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_ADDR_TRANSLATE, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("VA->PA translation failed"))?;
 
         Ok(cmd.phy_addr)
     }
@@ -824,16 +907,8 @@ impl WuWaDriver {
             mm_right: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_DEBUG_INFO,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Failed to get debug info"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_DEBUG_INFO, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Failed to get debug info"))?;
 
         Ok(cmd)
     }
@@ -842,16 +917,8 @@ impl WuWaDriver {
     pub fn at_s1e0r(&self, pid: pid_t, va: usize) -> Result<u64, anyhow::Error> {
         let mut cmd = WuwaAtS1e0rCmd { phy_addr: 0, pid, va };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_AT_S1E0R,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("AT S1E0R failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_AT_S1E0R, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("AT S1E0R failed"))?;
 
         Ok(cmd.phy_addr)
     }
@@ -869,16 +936,8 @@ impl WuWaDriver {
             },
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_PAGE_INFO,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Failed to get page info"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_PAGE_INFO, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Failed to get page info"))?;
 
         Ok(cmd.page)
     }
@@ -887,16 +946,8 @@ impl WuWaDriver {
     pub fn create_dma_buf(&self, pid: pid_t, va: usize, size: size_t) -> Result<c_int, anyhow::Error> {
         let mut cmd = WuwaDmaBufCreateCmd { pid, va, size, fd: -1 };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_DMA_BUF_CREATE,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("DMA-BUF creation failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_DMA_BUF_CREATE, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("DMA-BUF creation failed"))?;
 
         Ok(cmd.fd)
     }
@@ -916,16 +967,8 @@ impl WuWaDriver {
             hide: if hide { 1 } else { 0 },
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_PTE_MAPPING,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("PTE mapping failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_PTE_MAPPING, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("PTE mapping failed"))?;
 
         Ok(())
     }
@@ -949,16 +992,8 @@ impl WuWaDriver {
             pud_huge_count: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_PAGE_TABLE_WALK,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Page table walk failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_PAGE_TABLE_WALK, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Page table walk failed"))?;
 
         Ok(cmd)
     }
@@ -980,16 +1015,8 @@ impl WuWaDriver {
             page_status: std::ptr::null_mut(),
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_READ_PHYSICAL_MEMORY,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Physical memory read failed: va=0x{:x} size={}", src_va, size));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_READ_PHYSICAL_MEMORY, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Physical memory read failed: va=0x{:x} size={}", src_va, size))?;
 
         Ok(cmd.phy_addr)
     }
@@ -1043,24 +1070,17 @@ impl WuWaDriver {
             page_status: status.as_mut_ptr(),
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_READ_PHYSICAL_MEMORY,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
+        self.do_ioctl(WUWA_IOCTL_READ_PHYSICAL_MEMORY, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| {
                 let errno = Errno::last();
-                return Err(anyhow!(
-                    "read_physical_memory_with_status failed: va=0x{:x} size={}, result={}, errno={} ({})",
+                anyhow!(
+                    "read_physical_memory_with_status failed: va=0x{:x} size={}, errno={} ({})",
                     src_va,
                     size,
-                    result,
                     errno,
                     errno
-                ));
-            }
-        }
+                )
+            })?;
 
         Ok(cmd.phy_addr)
     }
@@ -1081,16 +1101,8 @@ impl WuWaDriver {
             phy_addr: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_WRITE_PHYSICAL_MEMORY,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Physical memory write failed: va=0x{:x} size={}", src_va, size));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_WRITE_PHYSICAL_MEMORY, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Physical memory write failed: va=0x{:x} size={}", src_va, size))?;
 
         Ok(cmd.phy_addr)
     }
@@ -1105,16 +1117,8 @@ impl WuWaDriver {
             nbytes: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_READ_MEMORY,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Memory read failed: va=0x{:x} size={}", src_va, size));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_READ_MEMORY, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Memory read failed: va=0x{:x} size={}", src_va, size))?;
 
         Ok(cmd.nbytes)
     }
@@ -1135,16 +1139,8 @@ impl WuWaDriver {
             nbytes: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_WRITE_MEMORY,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Memory write failed: va=0x{:x} size={}", src_va, size));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_WRITE_MEMORY, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Memory write failed: va=0x{:x} size={}", src_va, size))?;
 
         Ok(cmd.nbytes)
     }
@@ -1249,16 +1245,8 @@ impl WuWaDriver {
         let copy_len = std::cmp::min(name_bytes.len(), 255);
         cmd.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_GET_MODULE_BASE,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Module base query failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_GET_MODULE_BASE, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Module base query failed"))?;
 
         Ok(cmd.base)
     }
@@ -1271,16 +1259,8 @@ impl WuWaDriver {
         let copy_len = std::cmp::min(name_bytes.len(), 255);
         cmd.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_FIND_PROCESS,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Process search failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_FIND_PROCESS, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Process search failed"))?;
 
         if cmd.pid == 0 {
             return Err(anyhow!("Process not found"));
@@ -1293,16 +1273,8 @@ impl WuWaDriver {
     pub fn is_process_alive(&self, pid: pid_t) -> Result<bool, anyhow::Error> {
         let mut cmd = WuwaIsProcAliveCmd { pid, alive: 0 };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_IS_PROCESS_ALIVE,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Process liveness check failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_IS_PROCESS_ALIVE, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Process liveness check failed"))?;
 
         Ok(cmd.alive != 0)
     }
@@ -1311,16 +1283,8 @@ impl WuWaDriver {
     pub fn give_root(&self) -> Result<(), anyhow::Error> {
         let mut cmd = WuwaGiveRootCmd { result: 0 };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_GIVE_ROOT,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Root escalation failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_GIVE_ROOT, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Root escalation failed"))?;
 
         if cmd.result < 0 {
             return Err(anyhow!("Root escalation rejected: error {}", cmd.result));
@@ -1339,16 +1303,8 @@ impl WuWaDriver {
             result: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_HIDE_MODULE,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Hide module ioctl failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_HIDE_MODULE, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Hide module ioctl failed"))?;
 
         if cmd.result < 0 {
             return Err(anyhow!("Hide module failed: error {}", cmd.result));
@@ -1378,16 +1334,8 @@ impl WuWaDriver {
             prot,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_READ_MEMORY_IOREMAP,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("ioremap read failed: va=0x{:x} size={}", src_va, size));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_READ_MEMORY_IOREMAP, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("ioremap read failed: va=0x{:x} size={}", src_va, size))?;
 
         Ok(cmd.phy_addr)
     }
@@ -1413,16 +1361,8 @@ impl WuWaDriver {
             prot,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_WRITE_MEMORY_IOREMAP,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("ioremap write failed: va=0x{:x} size={}", src_va, size));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_WRITE_MEMORY_IOREMAP, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("ioremap write failed: va=0x{:x} size={}", src_va, size))?;
 
         Ok(cmd.phy_addr)
     }
@@ -1440,16 +1380,8 @@ impl WuWaDriver {
     pub fn bind_process(&self, pid: pid_t) -> Result<BindProc, anyhow::Error> {
         let mut cmd = WuwaBindProcCmd { pid, fd: -1 };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_BIND_PROC,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Process bind failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_BIND_PROC, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Process bind failed"))?;
 
         BindProc::from_fd(cmd.fd)
     }
@@ -1474,16 +1406,8 @@ impl WuWaDriver {
             child_tid: std::ptr::null_mut(),
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_COPY_PROCESS,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Process copy failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_COPY_PROCESS, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Process copy failed"))?;
 
         Ok(0)
     }
@@ -1505,15 +1429,8 @@ impl WuWaDriver {
             process_count: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_LIST_PROCESSES,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Vec::new();
-            }
+        if self.do_ioctl(WUWA_IOCTL_LIST_PROCESSES, &mut cmd as *mut _ as *mut c_void).is_err() {
+            return Vec::new();
         }
 
         // Parse bitmap and extract PIDs
@@ -1552,16 +1469,8 @@ impl WuWaDriver {
             tpidr_el0: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_GET_PROC_INFO,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Get process info failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_GET_PROC_INFO, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Get process info failed"))?;
 
         Ok(cmd)
     }
@@ -1586,16 +1495,8 @@ impl WuWaDriver {
     pub fn install_driver(&self, pid: pid_t) -> Result<c_int, anyhow::Error> {
         let mut cmd = WuwaInstallDriverCmd { pid, fd: -1 };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_INSTALL_DRIVER,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Install driver failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_INSTALL_DRIVER, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Install driver failed"))?;
 
         if cmd.fd < 0 {
             return Err(anyhow!("Install driver returned invalid fd"));
@@ -1699,16 +1600,8 @@ impl WuWaDriver {
             entry_count: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_QUERY_MEM_REGIONS,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Query memory regions failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_QUERY_MEM_REGIONS, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Query memory regions failed"))?;
 
         if cmd.fd < 0 {
             return Err(anyhow!("Query memory regions returned invalid fd"));
@@ -1756,16 +1649,8 @@ impl WuWaDriver {
         };
         cmd.regions[..count].copy_from_slice(&regions[..count]);
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_SIGNAL_FILTER,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Add signal filter ioctl failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_SIGNAL_FILTER, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Add signal filter ioctl failed"))?;
 
         Ok(cmd.result)
     }
@@ -1789,16 +1674,8 @@ impl WuWaDriver {
             result: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_SIGNAL_FILTER,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Remove signal filter ioctl failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_SIGNAL_FILTER, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Remove signal filter ioctl failed"))?;
 
         Ok(cmd.result)
     }
@@ -1825,16 +1702,8 @@ impl WuWaDriver {
             result: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_SIGNAL_FILTER,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Query signal filter ioctl failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_SIGNAL_FILTER, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Query signal filter ioctl failed"))?;
 
         if cmd.result != 0 {
             return Err(anyhow!("Query signal filter failed: {}", cmd.result));
@@ -1852,7 +1721,7 @@ impl WuWaDriver {
     /// # Arguments
     /// * `pid` - Target process PID
     /// * `regions` - Address regions to filter (max 16)
-    /// * `mode` - 0=hide completely, 1=show as ---p, 2=show as rw-p
+    /// * `mode` - 0=hide completely, 1=show as ---p, 2=show as rw-p, 3=split+---p, 4=split+rw-p
     ///
     /// # Returns
     /// 0 on success, negative error code on failure
@@ -1873,16 +1742,8 @@ impl WuWaDriver {
         };
         cmd.regions[..count].copy_from_slice(&regions[..count]);
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_MAPS_FILTER,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Add maps filter ioctl failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_MAPS_FILTER, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Add maps filter ioctl failed"))?;
 
         Ok(cmd.result)
     }
@@ -1904,16 +1765,8 @@ impl WuWaDriver {
             result: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_MAPS_FILTER,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Remove maps filter ioctl failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_MAPS_FILTER, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Remove maps filter ioctl failed"))?;
 
         Ok(cmd.result)
     }
@@ -1938,16 +1791,8 @@ impl WuWaDriver {
             result: 0,
         };
 
-        unsafe {
-            let result = ioctl(
-                self.sock.as_raw_fd(),
-                WUWA_IOCTL_MAPS_FILTER,
-                &mut cmd as *mut _ as *mut c_void,
-            );
-            if result < 0 {
-                return Err(anyhow!("Query maps filter ioctl failed"));
-            }
-        }
+        self.do_ioctl(WUWA_IOCTL_MAPS_FILTER, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("Query maps filter ioctl failed"))?;
 
         if cmd.result != 0 {
             return Err(anyhow!("Query maps filter failed: {}", cmd.result));

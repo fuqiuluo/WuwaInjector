@@ -12,3 +12,5 @@
 /.claude
 /.trae
 /test-payload/libpayload.so
+
+/tools
