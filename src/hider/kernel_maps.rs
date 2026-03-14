@@ -35,7 +35,7 @@ impl Hider for KernelMapsHider {
 
         let driver = WuWaDriver::new().context("kernel-maps: failed to connect to WuWa driver")?;
         let result = driver
-            .add_maps_filter(target.pid, &regions, 4)
+            .add_maps_filter(target.pid, &regions, 0)
             .context("kernel-maps: add_maps_filter failed")?;
 
         if result != 0 {
