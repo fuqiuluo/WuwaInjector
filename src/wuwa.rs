@@ -70,6 +70,11 @@ const WUWA_IOCTL_WRITE_MEMORY: Ioctl = _IOWR::<WuwaWriteMemoryCmd>(b'W' as u32, 
 const WUWA_IOCTL_HIDE_MODULE: Ioctl = _IOWR::<WuwaHideModuleCmd>(b'W' as u32, 25);
 const WUWA_IOCTL_SIGNAL_FILTER: Ioctl = _IOWR::<WuwaSignalFilterCmd>(b'W' as u32, 26);
 const WUWA_IOCTL_MAPS_FILTER: Ioctl = _IOWR::<WuwaMapsFilterCmd>(b'W' as u32, 27);
+const WUWA_IOCTL_PRINT_LOG: Ioctl = _IOWR::<WuwaPrintLogCmd>(b'W' as u32, 28);
+const WUWA_IOCTL_SHM_CREATE: Ioctl = _IOWR::<WuwaShmCreateCmd>(b'W' as u32, 29);
+const WUWA_IOCTL_SHM_MAP: Ioctl = _IOWR::<WuwaShmMapCmd>(b'W' as u32, 30);
+const WUWA_IOCTL_SHM_DESTROY: Ioctl = _IOWR::<WuwaShmDestroyCmd>(b'W' as u32, 31);
+const WUWA_IOCTL_BREAKPOINT: Ioctl = _IOWR::<WuwaBreakpointCmd>(b'W' as u32, 32);
 
 // Memory permission flags for memory regions
 pub const MEM_READABLE: u32 = 0b00000000000000000000000000000001;
@@ -273,6 +278,67 @@ pub struct WuwaMapsFilterCmd {
     pub mode: u32,  /* 0=hide, 1=---p, 2=rw-p, 3=split+---p, 4=split+rw-p */
     pub regions: [WuwaMapsFilterRegion; MAPS_FILTER_MAX_REGIONS],
     pub result: i32,
+}
+
+pub const PRINT_LOG_MAX_LEN: usize = 12288;
+
+#[repr(C)]
+pub struct WuwaPrintLogCmd {
+    pub msg: u64,   /* user-space pointer to message string */
+    pub len: u32,   /* message length in bytes (max PRINT_LOG_MAX_LEN) */
+    pub _pad: u32,
+}
+
+#[repr(C)]
+pub struct WuwaShmCreateCmd {
+    pub size: usize,    /* Input: buffer size in bytes */
+    pub shm_id: u64,    /* Output: shared memory handle */
+    pub va: usize,      /* Output: mapped address in caller */
+}
+
+#[repr(C)]
+pub struct WuwaShmMapCmd {
+    pub shm_id: u64,    /* Input: handle from shm_create */
+    pub va: usize,      /* Output: mapped address in caller */
+}
+
+#[repr(C)]
+pub struct WuwaShmDestroyCmd {
+    pub shm_id: u64,    /* Input: handle to destroy */
+}
+
+pub const BP_ACTION_ADD: u32        = 0;
+pub const BP_ACTION_REMOVE: u32     = 1;
+pub const BP_ACTION_REMOVE_ALL: u32 = 2;
+pub const BP_ACTION_QUERY: u32      = 3;
+
+pub const BP_MODE_DBI: i32         = 4;
+pub const BP_MODE_INLINE_HOOK: i32 = 5;
+pub const BP_MODE_INSTRUMENT: i32  = 6;
+
+pub const BP_FLAG_HIDE_MAPS: u32   = 1 << 0;
+pub const BP_FLAG_HIDE_SIGNAL: u32 = 1 << 1;
+
+/// Register context passed to `BP_MODE_INSTRUMENT` handlers.
+/// The handler receives `x0` = pointer to this struct (on the recompile stack).
+/// Modifying fields before returning will affect the restored register state.
+#[repr(C)]
+pub struct WuwaInstrumentContext {
+    pub x:  [u64; 31], /* x0-x30: general-purpose registers (x30 = lr) */
+    pub sp: u64,        /* original SP (before the instrumentation frame) */
+}
+
+#[repr(C)]
+pub struct WuwaBreakpointCmd {
+    pub pid:       i32,   /* Input: target process PID */
+    pub action:    u32,   /* Input: BP_ACTION_ADD/REMOVE/REMOVE_ALL/QUERY */
+    pub addr:      u64,   /* Input: breakpoint address */
+    pub new_addr:  u64,   /* Input: redirect address or handler address */
+    pub is_addr:   u64,   /* Output (BP_ACTION_ADD): original instruction in recompile page */
+    pub regsindex: i32,   /* reserved */
+    pub mode:      i32,   /* Input: BP_MODE_DBI / BP_MODE_INLINE_HOOK / BP_MODE_INSTRUMENT */
+    pub result:    i32,   /* Output: 0 on success or query result */
+    pub flags:     u32,   /* Input: BP_FLAG_HIDE_MAPS | BP_FLAG_HIDE_SIGNAL */
 }
 
 // Fault IPC structures — data-abort based IPC channel (no fd)
@@ -1800,5 +1866,129 @@ impl WuWaDriver {
 
         let count = cmd.region_count as usize;
         Ok((cmd.mode, cmd.regions[..count].to_vec()))
+    }
+
+    /// Print a message to the kernel log (dmesg / `logcat -b kernel`)
+    ///
+    /// # Arguments
+    /// * `msg` - Message to print (max `PRINT_LOG_MAX_LEN` bytes)
+    pub fn print_log(&self, msg: &str) -> Result<(), anyhow::Error> {
+        let bytes = msg.as_bytes();
+        let len = std::cmp::min(bytes.len(), PRINT_LOG_MAX_LEN);
+        let mut cmd = WuwaPrintLogCmd {
+            msg: bytes.as_ptr() as u64,
+            len: len as u32,
+            _pad: 0,
+        };
+        self.do_ioctl(WUWA_IOCTL_PRINT_LOG, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("print_log ioctl failed"))
+    }
+
+    /// Allocate shared memory and map it into the calling process.
+    /// Process A calls this to obtain the buffer and its handle.
+    ///
+    /// # Arguments
+    /// * `size` - Buffer size in bytes (page-aligned internally, max 64MB)
+    ///
+    /// # Returns
+    /// `(shm_id, addr)` on success
+    pub fn shm_create(&self, size: usize) -> Result<(u64, *mut c_void), anyhow::Error> {
+        let mut cmd = WuwaShmCreateCmd { size, shm_id: 0, va: 0 };
+        self.do_ioctl(WUWA_IOCTL_SHM_CREATE, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("shm_create ioctl failed"))?;
+        Ok((cmd.shm_id, cmd.va as *mut c_void))
+    }
+
+    /// Map an existing shared buffer into the calling process.
+    /// Process B calls this with the `shm_id` received from process A.
+    ///
+    /// # Arguments
+    /// * `shm_id` - Handle obtained from `shm_create`
+    ///
+    /// # Returns
+    /// Mapped address on success
+    pub fn shm_map(&self, shm_id: u64) -> Result<*mut c_void, anyhow::Error> {
+        let mut cmd = WuwaShmMapCmd { shm_id, va: 0 };
+        self.do_ioctl(WUWA_IOCTL_SHM_MAP, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("shm_map ioctl failed"))?;
+        Ok(cmd.va as *mut c_void)
+    }
+
+    /// Remove the shared buffer from the driver registry.
+    /// Physical pages are freed when all mapped VMAs are closed.
+    ///
+    /// # Arguments
+    /// * `shm_id` - Handle to destroy
+    pub fn shm_destroy(&self, shm_id: u64) -> Result<(), anyhow::Error> {
+        let mut cmd = WuwaShmDestroyCmd { shm_id };
+        self.do_ioctl(WUWA_IOCTL_SHM_DESTROY, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("shm_destroy ioctl failed"))
+    }
+
+    /// Install a breakpoint at the given address.
+    ///
+    /// # Arguments
+    /// * `pid`     - Target process PID
+    /// * `addr`    - Address to intercept
+    /// * `handler` - Handler/redirect address
+    /// * `mode`    - `BP_MODE_DBI` / `BP_MODE_INLINE_HOOK` / `BP_MODE_INSTRUMENT`
+    /// * `flags`   - `BP_FLAG_HIDE_MAPS` | `BP_FLAG_HIDE_SIGNAL`
+    ///
+    /// # Returns
+    /// Address of the original instruction in the recompile page on success
+    pub fn breakpoint_add(&self, pid: i32, addr: u64, handler: u64,
+                          mode: i32, flags: u32) -> Result<u64, anyhow::Error> {
+        let mut cmd = WuwaBreakpointCmd {
+            pid, action: BP_ACTION_ADD, addr, new_addr: handler,
+            is_addr: 0, regsindex: 0, mode, result: 0, flags,
+        };
+        self.do_ioctl(WUWA_IOCTL_BREAKPOINT, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("breakpoint_add ioctl failed"))?;
+        Ok(cmd.is_addr)
+    }
+
+    /// Remove the breakpoint at the given address.
+    ///
+    /// # Arguments
+    /// * `pid`  - Target process PID
+    /// * `addr` - Breakpoint address
+    pub fn breakpoint_remove(&self, pid: i32, addr: u64) -> Result<(), anyhow::Error> {
+        let mut cmd = WuwaBreakpointCmd {
+            pid, action: BP_ACTION_REMOVE, addr, new_addr: 0,
+            is_addr: 0, regsindex: 0, mode: 0, result: 0, flags: 0,
+        };
+        self.do_ioctl(WUWA_IOCTL_BREAKPOINT, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("breakpoint_remove ioctl failed"))
+    }
+
+    /// Remove all breakpoints for a process.
+    ///
+    /// # Arguments
+    /// * `pid` - Target process PID
+    pub fn breakpoint_remove_all(&self, pid: i32) -> Result<(), anyhow::Error> {
+        let mut cmd = WuwaBreakpointCmd {
+            pid, action: BP_ACTION_REMOVE_ALL, addr: 0, new_addr: 0,
+            is_addr: 0, regsindex: 0, mode: 0, result: 0, flags: 0,
+        };
+        self.do_ioctl(WUWA_IOCTL_BREAKPOINT, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("breakpoint_remove_all ioctl failed"))
+    }
+
+    /// Query whether a breakpoint is installed at the given address.
+    ///
+    /// # Arguments
+    /// * `pid`  - Target process PID
+    /// * `addr` - Breakpoint address
+    ///
+    /// # Returns
+    /// Mode value (`BP_MODE_DBI` etc.) if installed
+    pub fn breakpoint_query(&self, pid: i32, addr: u64) -> Result<i32, anyhow::Error> {
+        let mut cmd = WuwaBreakpointCmd {
+            pid, action: BP_ACTION_QUERY, addr, new_addr: 0,
+            is_addr: 0, regsindex: 0, mode: 0, result: 0, flags: 0,
+        };
+        self.do_ioctl(WUWA_IOCTL_BREAKPOINT, &mut cmd as *mut _ as *mut c_void)
+            .map_err(|_| anyhow!("breakpoint_query ioctl failed"))?;
+        Ok(cmd.result)
     }
 }

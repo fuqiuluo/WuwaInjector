@@ -78,21 +78,35 @@ impl Hider for SolistHider {
             return Ok(false);
         }
 
-        if prev == 0 {
-            warn!("hide_solist: target is first in solist, cannot remove");
-            return Ok(false);
-        }
-
         let next_buf = target.proc.read_mem(trav + si_next_offset, 8)?;
         let next: usize = usize::from_ne_bytes(next_buf.try_into().unwrap());
 
-        target.proc.write_mem_io(prev + si_next_offset, &next.to_ne_bytes())?;
-        info!("hide_solist: unlinked soinfo {:#x} (base={:#x}) from solist", trav, target.base_addr);
+        if prev == 0 {
+            // android_dlopen_ext 通常把新库插到 solist 头部，直接更新头指针
+            target.proc.write_mem_io(solist_addr, &next.to_ne_bytes())?;
+            info!("hide_solist: target is solist head, updated solist to {:#x}", next);
+        } else {
+            target.proc.write_mem_io(prev + si_next_offset, &next.to_ne_bytes())?;
+            info!("hide_solist: unlinked soinfo {:#x} (base={:#x}) from solist", trav, target.base_addr);
+        }
 
         if trav == sonext {
-            target.proc.write_mem_io(sonext_addr, &prev.to_ne_bytes())?;
-            info!("hide_solist: updated sonext to {:#x}", prev);
+            // sonext 是 tail 指针，目标在头时新 tail = next，否则新 tail = prev
+            let new_sonext = if prev == 0 { next } else { prev };
+            target.proc.write_mem_io(sonext_addr, &new_sonext.to_ne_bytes())?;
+            info!("hide_solist: updated sonext to {:#x}", new_sonext);
         }
+
+        // 清零 soinfo 识别字段，防止 ACE 直接扫描 linker 堆找到残留 soinfo：
+        //   phdr @ +0x00，phnum @ +0x08，base_ @ +si_base_offset，size_ @ +0x18
+        // dynamic_/fini_array_ 等函数指针保留，避免进程退出时 linker 解引用崩溃
+        let zero = 0usize.to_ne_bytes();
+        for &off in &[0x00usize, 0x08, si_base_offset, 0x18] {
+            if let Err(e) = target.proc.write_mem_io(trav + off, &zero) {
+                warn!("hide_solist: failed to zero soinfo+{:#x}: {e:#}", off);
+            }
+        }
+        info!("hide_solist: zeroed soinfo phdr/base/size at {:#x}", trav);
 
         Ok(true)
     }
