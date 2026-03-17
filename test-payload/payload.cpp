@@ -12,6 +12,24 @@
 
 #define TAG "InjectTest"
 
+// 产生 __cxa_atexit 注册
+struct NontrivialGlobal {
+    int id;
+    char name[32];
+    NontrivialGlobal(int i, const char *n) : id(i) {
+        strncpy(name, n, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+    }
+    ~NontrivialGlobal() {
+        // 析构函数非平凡，编译器会自动注册 __cxa_atexit
+        __android_log_print(ANDROID_LOG_INFO, TAG, "~NontrivialGlobal(%d, \"%s\")", id, name);
+    }
+};
+
+static NontrivialGlobal g_obj_alpha(1, "alpha");
+static NontrivialGlobal g_obj_beta(2, "beta");
+static NontrivialGlobal g_obj_gamma(3, "gamma");
+
 static int g_counter = 0;
 
 static void *counter_thread(void *arg) {
@@ -86,6 +104,60 @@ static void dump_solist(void) {
         __android_log_print(ANDROID_LOG_INFO, TAG, "solist check: payload NOT found in solist (hidden OK), total=%d", ctx.total);
     } else {
         __android_log_print(ANDROID_LOG_WARN, TAG, "solist check: found %d entries in solist (NOT hidden), total=%d", ctx.found, ctx.total);
+    }
+}
+
+// 通过 dl_iterate_phdr 找到主程序的 PT_DYNAMIC，从 DT_DEBUG 获取 r_debug
+static struct r_debug *find_r_debug(void) {
+    struct r_debug *result = NULL;
+    dl_iterate_phdr([](struct dl_phdr_info *info, size_t, void *data) -> int {
+        for (int i = 0; i < info->dlpi_phnum; i++) {
+            if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+                ElfW(Dyn) *dyn = (ElfW(Dyn) *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+                for (; dyn->d_tag != DT_NULL; dyn++) {
+                    if (dyn->d_tag == DT_DEBUG && dyn->d_un.d_ptr != 0) {
+                        *(struct r_debug **)data = (struct r_debug *)dyn->d_un.d_ptr;
+                        return 1;
+                    }
+                }
+            }
+        }
+        return 0;
+    }, &result);
+    return result;
+}
+
+static void dump_r_debug(void) {
+    struct r_debug *dbg = find_r_debug();
+    if (!dbg) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "r_debug check: DT_DEBUG not found");
+        return;
+    }
+
+    int total = 0, suspicious = 0;
+    for (struct link_map *lm = dbg->r_map; lm != NULL; lm = lm->l_next) {
+        total++;
+        const char *name = lm->l_name;
+        if (!name || name[0] == '\0') continue;
+
+        int is_suspicious = 0;
+        if (strstr(name, "payload") || strstr(name, "memfd:")) {
+            is_suspicious = 1;
+        }
+
+        if (is_suspicious) {
+            __android_log_print(ANDROID_LOG_WARN, TAG,
+                "r_debug VISIBLE: %s (base=%p)", name, (void *)lm->l_addr);
+            suspicious++;
+        }
+    }
+
+    if (suspicious == 0) {
+        __android_log_print(ANDROID_LOG_INFO, TAG,
+            "r_debug check: payload NOT found in link_map (hidden OK), total=%d", total);
+    } else {
+        __android_log_print(ANDROID_LOG_WARN, TAG,
+            "r_debug check: found %d entries in link_map (NOT hidden), total=%d", suspicious, total);
     }
 }
 
@@ -205,6 +277,87 @@ static void dump_suspicious_threads(void) {
     __android_log_print(ANDROID_LOG_INFO, TAG, "thread check: %d threads total, %d suspicious", total, suspicious);
 }
 
+// ==================== atexit 链表检测 ====================
+// Android 11+ bionic 将 __cxa_atexit entry 存在 [anon:atexit handlers] mmap 区域
+// 遍历所有 entry，用 dladdr 查 fn 所属 so，不在 /system /apex /vendor 下即为可疑
+
+struct AtexitEntry {
+    void (*fn)(void *);   // +0,  8 bytes
+    void *arg;            // +8,  8 bytes
+    void *dso;            // +16, 8 bytes
+};
+
+static void dump_atexit(void) {
+    // 在 /proc/self/maps 中查找 [anon:atexit handlers]
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) return;
+
+    unsigned long region_start = 0, region_end = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "[anon:atexit handlers]")) {
+            sscanf(line, "%lx-%lx", &region_start, &region_end);
+            break;
+        }
+    }
+    fclose(fp);
+
+    if (!region_start) {
+        __android_log_print(ANDROID_LOG_WARN, TAG,
+            "atexit check: [anon:atexit handlers] not found (Android < 11?)");
+        return;
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, TAG,
+        "atexit check: handlers region %lx-%lx (%lu bytes)",
+        region_start, region_end, region_end - region_start);
+
+    AtexitEntry *entries = (AtexitEntry *)region_start;
+    size_t capacity = (region_end - region_start) / sizeof(AtexitEntry);
+
+    int total = 0, suspicious = 0;
+    for (size_t i = 0; i < capacity; i++) {
+        if (!entries[i].fn) continue;
+        total++;
+
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        int found = dladdr((void *)entries[i].fn, &info);
+
+        const char *lib = "(unknown)";
+        if (found && info.dli_fname) {
+            lib = info.dli_fname;
+        }
+
+        int is_suspicious = 0;
+        if (!found || !info.dli_fname) {
+            // dladdr 查不到 -> 函数在匿名内存中（maps hider 重映射后）
+            is_suspicious = 1;
+        } else if (strncmp(info.dli_fname, "/system/", 8) != 0 &&
+                   strncmp(info.dli_fname, "/system_ext/", 12) != 0 &&
+                   strncmp(info.dli_fname, "/apex/", 6) != 0 &&
+                   strncmp(info.dli_fname, "/vendor/", 8) != 0) {
+            // 不在系统路径下 -> 第三方注入
+            is_suspicious = 1;
+        }
+
+        if (is_suspicious) {
+            __android_log_print(ANDROID_LOG_WARN, TAG,
+                "atexit SUSPICIOUS [%zu]: fn=%p arg=%p dso=%p -> %s",
+                i, (void *)entries[i].fn, entries[i].arg, entries[i].dso, lib);
+            suspicious++;
+        }
+    }
+
+    if (suspicious > 0) {
+        __android_log_print(ANDROID_LOG_WARN, TAG,
+            "atexit check: %d/%d entries suspicious - INJECTION DETECTED!", suspicious, total);
+    } else {
+        __android_log_print(ANDROID_LOG_INFO, TAG,
+            "atexit check: %d entries, all clean (OK)", total);
+    }
+}
+
 static void dump_elf_in_anon(void) {
     static const unsigned char elf_magic[4] = { 0x7f, 'E', 'L', 'F' };
 
@@ -267,7 +420,7 @@ static void init(void) {
 /// 使用方式: injector --jni-key 0x1337 ...
 #define INJECTOR_KEY 0x1337
 
-__attribute__((visibility("default")))
+extern "C" __attribute__((visibility("default")))
 int JNI_OnLoad(void *vm, void *reserved) {
     if (reserved != (void *)INJECTOR_KEY) {
         __android_log_print(ANDROID_LOG_WARN, TAG,
@@ -297,10 +450,12 @@ int JNI_OnLoad(void *vm, void *reserved) {
 
     dump_self_maps();
     dump_solist();
+    dump_r_debug();
     dump_anon_exec();
     dump_suspicious_fds();
     dump_suspicious_threads();
     dump_elf_in_anon();
+    dump_atexit();
 
     pthread_t tid;
     pthread_create(&tid, NULL, counter_thread, NULL);

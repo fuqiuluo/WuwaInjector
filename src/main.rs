@@ -21,6 +21,7 @@ use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 enum HiderKind {
     Maps,
     Solist,
+    LinkMap,
     KernelMaps,
     KernelSignal,
     KernelSignalDeny,
@@ -69,6 +70,7 @@ fn build_hiders(kinds: &[HiderKind]) -> Vec<Box<dyn hider::Hider>> {
             match k {
                 HiderKind::Maps => Box::new(hider::maps::MapsHider),
                 HiderKind::Solist => Box::new(hider::solist::SolistHider),
+                HiderKind::LinkMap => Box::new(hider::link_map::LinkMapHider),
                 HiderKind::KernelMaps => Box::new(hider::kernel_maps::KernelMapsHider),
                 HiderKind::KernelSignal => Box::new(hider::kernel_signal::KernelSignalHider),
                 HiderKind::KernelSignalDeny => Box::new(hider::kernel_signal_deny::KernelSignalDenyHider),

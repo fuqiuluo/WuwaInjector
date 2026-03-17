@@ -2,7 +2,7 @@ mod dlopen;
 mod memfd;
 
 use crate::hider::{HideTarget, Hider};
-use crate::ptrace_ex::{find_remote_lib_base, remote_close, remote_dlsym};
+use crate::ptrace_ex::{find_remote_lib_base, find_remote_symbol, remote_close, remote_dlsym};
 use crate::ptrace_ext::RemoteProcess;
 use anyhow::{Result, bail};
 use log::{debug, info, warn};
@@ -97,6 +97,12 @@ pub fn inject(
         warn!("Could not find a suitable default_caller, remote calls may fail");
     }
 
+    // Patch __cxa_atexit 为立即返回 0，防止注入库的全局对象析构函数被注册
+    let cxa_patch = patch_cxa_atexit(&proc, pid);
+    if let Err(ref e) = cxa_patch {
+        warn!("Failed to patch __cxa_atexit: {e:#}, continuing without patch");
+    }
+
     let result = do_inject(&proc, pid, lib_path, use_memfd, hiders);
 
     if let Ok(ref info) = result {
@@ -111,6 +117,15 @@ pub fn inject(
                 }
                 _ => debug!("No JNI_OnLoad symbol found, skipping"),
             }
+        }
+    }
+
+    // 恢复 __cxa_atexit 原始字节
+    if let Ok((addr, original)) = cxa_patch {
+        if let Err(e) = proc.write_mem_io(addr, &original) {
+            warn!("Failed to restore __cxa_atexit: {e:#}");
+        } else {
+            debug!("Restored __cxa_atexit at {:#x}", addr);
         }
     }
 
@@ -224,4 +239,26 @@ fn collect_lib_regions(pid: i32, search_name: &str) -> (Vec<LibMemoryRegion>, u6
     }
 
     (regions, total_size)
+}
+
+/// Patch __cxa_atexit 为立即返回 0（MOV W0, WZR + RET），返回地址和原始字节用于后续恢复
+fn patch_cxa_atexit(proc: &RemoteProcess, pid: i32) -> Result<(usize, Vec<u8>)> {
+    unsafe extern "C" {
+        safe fn __cxa_atexit(
+            f: unsafe extern "C" fn(*mut libc::c_void),
+            arg: *mut libc::c_void,
+            dso: *mut libc::c_void,
+        ) -> libc::c_int;
+    }
+    let local_cxa = __cxa_atexit as usize;
+    let remote_cxa = find_remote_symbol(pid, "libc.so", local_cxa)?;
+
+    let original = proc.read_mem(remote_cxa, 8)?;
+
+    // MOV W0, WZR (0x2A1F03E0) + RET (0xD65F03C0)
+    let patch: [u8; 8] = [0xE0, 0x03, 0x1F, 0x2A, 0xC0, 0x03, 0x5F, 0xD6];
+    proc.write_mem_io(remote_cxa, &patch)?;
+
+    info!("Patched __cxa_atexit at {:#x}", remote_cxa);
+    Ok((remote_cxa, original))
 }
