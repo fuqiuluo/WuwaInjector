@@ -5,13 +5,17 @@ use crate::wuwa::{WuWaDriver, WuwaSignalFilterRegion};
 
 use super::{HideTarget, Hider};
 
-/// 通过 WuWa 内核驱动过滤注入库内存区域内的 SIGPROF 信号
+/// 通过 WuWa 内核驱动过滤注入库内存区域内的信号
 ///
-/// profiler 采样会向进程发送 SIGPROF，采样时记录的 PC 地址如果落在注入库范围内，
-/// 就会泄漏注入痕迹。此 hider 在内核层拦截 PC 位于注入库区域时的 SIGPROF 投递。
+/// 反作弊可以通过 setitimer / timer_create 等方式向进程发送各种信号（SIGPROF、
+/// SIGVTALRM、SIGALRM、自定义信号等），采样时记录的 PC 地址如果落在注入库范围内，
+/// 就会泄漏注入痕迹。此 hider 在内核层拦截 PC 位于注入库区域时的所有可过滤信号投递。
+///
+/// SIGKILL(9) 和 SIGSTOP(19) 无法被拦截，因此不包含在过滤掩码中。
 pub struct KernelSignalHider;
 
-const SIGPROF: u32 = 27;
+const SIGKILL: u32 = 9;
+const SIGSTOP: u32 = 19;
 
 fn sigmask(sig: u32) -> u64 {
     1u64 << (sig - 1)
@@ -37,10 +41,11 @@ impl Hider for KernelSignalHider {
             })
             .collect();
 
-        let mask = sigmask(SIGPROF);
+        let mask = !( sigmask(SIGKILL) | sigmask(SIGSTOP) );
 
         info!(
-            "kernel-signal: filtering SIGPROF for {} regions of {}",
+            "kernel-signal: filtering all signals (mask=0x{:016x}) for {} regions of {}",
+            mask,
             regions.len(),
             target.maps_search_name
         );
